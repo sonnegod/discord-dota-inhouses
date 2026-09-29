@@ -5,9 +5,11 @@ import { createSteamLinks } from './steam-link.js';
 const required = ['DISCORD_TOKEN', 'DISCORD_GUILD_ID', 'DISCORD_CHANNEL_ID', 'PUBLIC_BASE_URL'];
 for (const name of required) if (!process.env[name]) throw new Error(`${name} is required`);
 const options = {
+  testSoloLobby: process.env.TEST_SOLO_LOBBY === 'true',
   priorityRoles: (process.env.ROLE_PRIORITY_IDS || '').split(',').map(s => s.trim()).filter(Boolean),
   maxWaitMinutes: Number(process.env.MMR_MAX_WAIT_MINUTES || 30)
 };
+const requiredPlayers = options.testSoloLobby ? 1 : 10;
 if (!Number.isFinite(options.maxWaitMinutes) || options.maxWaitMinutes < 1) throw new Error('MMR_MAX_WAIT_MINUTES must be positive');
 const db = openDatabase(process.env.DB_PATH || './inhouses.db', {
   queueMode: process.env.QUEUE_MODE || 'fifo',
@@ -65,14 +67,14 @@ client.on(Events.InteractionCreate, async interaction => {
         if (action === 'join') {
           const roles = interaction.member.roles?.cache ? [...interaction.member.roles.cache.keys()] : interaction.member.roles || [];
           const result = joinQueue(db, id, roles, options);
-          content = result.match ? `Match #${result.match.id} formed. Waiting for the Dota lobby.` : `Queued. ${result.count}/10 waiting.`;
+          content = result.match ? `Match #${result.match.id} formed. Waiting for the Dota lobby.` : `Queued. ${result.count}/${requiredPlayers} waiting.`;
           if (result.match) void announce(formatMatch(result.match));
         } else if (action === 'leave') content = leaveQueue(db, id) ? 'You left the queue.' : 'You are not queued.';
         else {
           const active = getActiveMatch(db);
           const queue = queueList(db);
           const shown = queue.slice(0, 20);
-          content = `Queue: ${queue.length}/10 — ${shown.length ? shown.map((p, i) => `${i + 1}. <@${p.discord_id}>`).join(' ') : 'empty'}${queue.length > shown.length ? ` …and ${queue.length - shown.length} more` : ''}\n${active ? `Match #${active.id}: ${active.status}` : 'No active match.'}`;
+          content = `Queue: ${queue.length}/${requiredPlayers} — ${shown.length ? shown.map((p, i) => `${i + 1}. <@${p.discord_id}>`).join(' ') : 'empty'}${queue.length > shown.length ? ` …and ${queue.length - shown.length} more` : ''}\n${active ? `Match #${active.id}: ${active.status}` : 'No active match.'}`;
           const settings = getSettings(db);
           content = `Queue mode: ${settings.queue_mode}. Lobby mode: ${settings.game_mode.toUpperCase()}.\n${content}`;
         }
@@ -150,7 +152,7 @@ async function tick() {
     const match = getActiveMatch(db);
     if (match && seen.get(match.id) !== match.status) {
       seen.set(match.id, match.status);
-      if (match.status === 'lobby') await announce(`Match #${match.id}: Dota lobby ${match.lobby_id} is ready. Check your Steam invites, join your assigned team, and the match will launch when all ten players are in place.`);
+      if (match.status === 'lobby') await announce(`Match #${match.id}: Dota lobby ${match.lobby_id} is ready. Check your Steam invites, join your assigned team, and the match will launch when all ten players are in place. Solo test lobbies stay open without auto-launch.`);
       if (match.status === 'live') await announce(`Match #${match.id} has started${match.dota_match_id ? ` (Dota match ${match.dota_match_id})` : ''}.`);
       if (match.status === 'results_pending') await announce(`Match #${match.id} ended. Waiting for the Dota result.`);
     }

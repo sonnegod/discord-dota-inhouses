@@ -34,6 +34,25 @@ test('ten linked players form one persistent match and results drive stats', () 
   db.close();
 });
 
+test('solo test mode forms a persistent Radiant lobby and keeps later players queued', () => {
+  const db = openDatabase(':memory:');
+  try {
+    const options = { testSoloLobby: true };
+    linkPlayer(db, 'a', '76561197960265729');
+    const { match } = joinQueue(db, 'a', [], options);
+    assert.equal(match.players.length, 1);
+    assert.equal(match.players[0].team, 'radiant');
+    assert.equal(db.prepare('SELECT status FROM matches WHERE id=?').get(match.id).status, 'pending');
+    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM match_players').get().n, 1);
+    linkPlayer(db, 'b', '76561197960265730');
+    assert.equal(joinQueue(db, 'b', [], options).match, null);
+    assert.equal(queueList(db).length, 1);
+    db.prepare("UPDATE matches SET status='cancelled' WHERE id=?").run(match.id);
+    assert.equal(maybeCreateMatch(db, {}), null);
+    assert.equal(maybeCreateMatch(db, options).players[0].discord_id, 'b');
+  } finally { db.close(); }
+});
+
 test('a Steam ID cannot be linked to two Discord accounts', () => {
   const db = openDatabase(':memory:');
   linkPlayer(db, 'a', '76561197960265729');

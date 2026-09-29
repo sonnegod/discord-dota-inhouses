@@ -115,9 +115,9 @@ function createMatch(db, options) {
   const players = db.prepare(`SELECT q.discord_id,q.joined_at,q.rowid AS queue_order,q.role_ids,p.steam_id,p.mmr FROM queue q
     JOIN players p ON p.discord_id=q.discord_id ORDER BY q.rowid`).all();
   const settings = getSettings(db);
-  const selected = selectPlayers(players, settings.queue_mode, options.priorityRoles, options.maxWaitMinutes);
+  const selected = options.testSoloLobby ? (players.length ? players.slice(0, 1) : null) : selectPlayers(players, settings.queue_mode, options.priorityRoles, options.maxWaitMinutes);
   if (!selected) return null;
-  const teams = balanceTeams(selected);
+  const teams = options.testSoloLobby ? selected.map(p => ({ ...p, team: 'radiant' })) : balanceTeams(selected);
   const result = db.prepare("INSERT INTO matches(status,game_mode,created_at) VALUES('pending',?,?)").run(settings.game_mode, Date.now());
   const matchId = Number(result.lastInsertRowid);
   const add = db.prepare('INSERT INTO match_players(match_id,discord_id,steam_id,team,mmr_at_match) VALUES(?,?,?,?,?)');
