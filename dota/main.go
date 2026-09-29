@@ -10,7 +10,9 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -39,6 +41,10 @@ type player struct {
 }
 
 var lastResultPoll time.Time
+var lastLobbyInvite time.Time
+var lastPlayerPoolRequest time.Time
+var lastPlayerPoolLobbyID uint64
+var confirmedPlayerPoolLobbyID uint64
 
 func main() {
 	username := os.Getenv("STEAM_USERNAME")
@@ -47,6 +53,7 @@ func main() {
 	if username == "" || (password == "" && token == "") {
 		log.Fatal("STEAM_USERNAME and STEAM_PASSWORD or STEAM_ACCESS_TOKEN are required")
 	}
+	log.Print("Dota worker starting")
 	path := os.Getenv("DB_PATH")
 	if path == "" {
 		path = "./inhouses.db"
@@ -63,33 +70,45 @@ func main() {
 	if _, err = db.Exec("SELECT id FROM matches LIMIT 1"); err != nil {
 		log.Fatal("Start the Discord service once to initialize the database: ", err)
 	}
+	absolutePath, err := filepath.Abs(path)
+	if err != nil {
+		absolutePath = path
+	}
+	log.Printf("Dota worker database ready at %s", absolutePath)
+	defer workerStopped(db)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
+	log.Print("Initializing Steam client")
 	client := steam.NewClient()
 	dota := dota2.New(client, logrus.New())
 	defer dota.Close()
+	log.Print("Steam client initialized")
 	details := &steam.LogOnDetails{Username: username, Password: password, AccessToken: token}
+	if password != "" && token == "" {
+		details.ConfirmSteamGuard = promptSteamGuard
+	}
 	var gcReady atomic.Bool
 	var steamLoggedOn atomic.Bool
 	go func() {
 		for event := range client.Events() {
 			switch e := event.(type) {
 			case *steam.ConnectedEvent:
-				loginCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-				if err := client.Auth.LogOn(loginCtx, details); err != nil {
+				log.Print("Steam transport connected; logging in")
+				if err := client.Auth.LogOn(ctx, details); err != nil {
 					log.Printf("Steam login: %v", err)
 				}
-				cancel()
 			case *steam.LoggedOnEvent:
 				client.Social.SetPersonaState(steamlang.EPersonaState_Online)
 				dota.SetPlaying(true)
 				steamLoggedOn.Store(true)
-				log.Print("Steam logged on; waiting for Dota coordinator")
+				log.Printf("Steam logged on as SteamID %d; waiting for Dota coordinator", client.SteamId().ToUint64())
 			case *steam.DisconnectedEvent:
+				log.Print("Steam transport disconnected")
 				gcReady.Store(false)
 				steamLoggedOn.Store(false)
 			case *devents.GCConnectionStatusChanged:
+				log.Printf("Dota coordinator status: %v", e.NewState)
 				gcReady.Store(e.NewState == proto.GCConnectionStatus_GCConnectionStatus_HAVE_SESSION)
 			case error:
 				log.Printf("Steam event: %v", e)
@@ -99,16 +118,50 @@ func main() {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	var lastHello time.Time
+	paused := false
 	for {
 		select {
 		case <-ctx.Done():
 			client.Disconnect()
 			return
 		case <-ticker.C:
+			enabled, err := workerEnabled(db)
+			if err != nil {
+				log.Printf("Dota worker control: %v", err)
+				continue
+			}
+			if !enabled {
+				if !paused {
+					log.Print("Steam/Dota worker paused; Discord bot can stay online")
+					paused = true
+				}
+				if client.Connected() {
+					if steamLoggedOn.Load() {
+						client.Social.SetPersonaState(steamlang.EPersonaState_Offline)
+						dota.SetPlaying(false)
+					}
+					client.Disconnect()
+				}
+				steamLoggedOn.Store(false)
+				gcReady.Store(false)
+				lastHello = time.Time{}
+				if err := workerHeartbeat(db, false); err != nil {
+					log.Printf("Dota worker heartbeat: %v", err)
+				}
+				continue
+			}
+			if paused {
+				log.Print("Steam/Dota worker resuming")
+				paused = false
+			}
+			if err := workerHeartbeat(db, steamLoggedOn.Load()); err != nil {
+				log.Printf("Dota worker heartbeat: %v", err)
+			}
 			if !client.Connected() {
-				connectCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-				_, err := client.ConnectContext(connectCtx)
-				cancel()
+				log.Print("Connecting to Steam")
+				// ConnectContext uses ctx for the transport's full lifetime. The
+				// library applies its own timeout to discovery and dialing.
+				_, err := client.ConnectContext(ctx)
 				if err != nil {
 					log.Printf("Steam connect: %v", err)
 				}
@@ -121,14 +174,14 @@ func main() {
 				}
 				continue
 			}
-			if err := tick(ctx, db, dota); err != nil {
+			if err := tick(ctx, db, dota, client.SteamId().ToUint64()); err != nil {
 				log.Printf("Dota worker: %v", err)
 			}
 		}
 	}
 }
 
-func tick(ctx context.Context, db *sql.DB, dota *dota2.Dota2) error {
+func tick(ctx context.Context, db *sql.DB, dota *dota2.Dota2, workerSteamID uint64) error {
 	m, err := activeMatch(db)
 	if err != nil {
 		return err
@@ -144,6 +197,14 @@ func tick(ctx context.Context, db *sql.DB, dota *dota2.Dota2) error {
 		return err
 	}
 	if m.status == "pending" {
+		players, err := matchPlayers(db, m.id)
+		if err != nil {
+			return err
+		}
+		if err := validateInviteRecipients(players, workerSteamID); err != nil {
+			_, dbErr := db.Exec("UPDATE matches SET status='failed',error=?,finished_at=? WHERE id=? AND status='pending'", err.Error(), time.Now().UnixMilli(), m.id)
+			return dbErr
+		}
 		gameMode, err := configuredGameMode(m.gameMode)
 		if err != nil {
 			return err
@@ -159,17 +220,10 @@ func tick(ctx context.Context, db *sql.DB, dota *dota2.Dota2) error {
 		if rows, _ := claimed.RowsAffected(); rows == 0 {
 			return nil
 		}
-		name := os.Getenv("LOBBY_NAME")
-		if name == "" {
-			name = "Discord Inhouse"
-		}
-		pass := os.Getenv("LOBBY_PASS_KEY")
-		if pass == "" {
-			secret := make([]byte, 12)
-			if _, err := rand.Read(secret); err != nil {
-				return err
-			}
-			pass = hex.EncodeToString(secret)
+		name := matchLobbyName(os.Getenv("LOBBY_NAME"), m.id)
+		pass, err := lobbyPassword(os.Getenv("LOBBY_PASS_KEY"))
+		if err != nil {
+			return err
 		}
 		regionString := os.Getenv("LOBBY_SERVER_REGION")
 		var region uint32
@@ -180,7 +234,7 @@ func tick(ctx context.Context, db *sql.DB, dota *dota2.Dota2) error {
 			}
 			region = uint32(parsed)
 		}
-		visibility := proto.DOTALobbyVisibility_DOTALobbyVisibility_Unlisted
+		visibility := proto.DOTALobbyVisibility_DOTALobbyVisibility_Public
 		allowSpectating := true
 		createCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
 		err = dota.LeaveCreateLobby(createCtx, &proto.CMsgPracticeLobbySetDetails{
@@ -213,25 +267,31 @@ func tick(ctx context.Context, db *sql.DB, dota *dota2.Dota2) error {
 			_, err := dota.DestroyLobby(ctx)
 			return err
 		}
-		dota.JoinLobbyTeam(proto.DOTA_GC_TEAM_DOTA_GC_TEAM_SPECTATOR, 0)
-		players, err := matchPlayers(db, m.id)
+		ensureWorkerInPlayerPool(dota, lobby, workerSteamID)
+		players, err = matchPlayers(db, m.id)
 		if err != nil {
 			return err
 		}
+		log.Printf("match %d: preparing lobby %d invite list (%d players)", m.id, lobby.GetLobbyId(), len(players))
 		// Single-player matches are test lobbies; lobbyReady keeps them from auto-launching.
 		if len(players) != 10 && len(players) != 1 {
 			return fmt.Errorf("match %d has %d players, expected 10 (or 1 for a test lobby)", m.id, len(players))
+		}
+		if err := validateInviteRecipients(players, workerSteamID); err != nil {
+			return err
 		}
 		for _, p := range players {
 			id, err := strconv.ParseUint(p.steamID, 10, 64)
 			if err != nil {
 				return err
 			}
+			log.Printf("match %d: requesting invite to steamID %s (team %s) for lobby %d", m.id, p.steamID, p.team, lobby.GetLobbyId())
 			dota.InviteLobbyMember(steamid.SteamId(id))
 		}
+		lastLobbyInvite = time.Now()
 		_, err = db.Exec("UPDATE matches SET status='lobby',lobby_id=? WHERE id=? AND status='creating'", strconv.FormatUint(lobby.GetLobbyId(), 10), m.id)
 		if err == nil {
-			log.Printf("match %d: invited %d players to lobby %d", m.id, len(players), lobby.GetLobbyId())
+			log.Printf("match %d: requested invites for %d players to lobby %d; delivery is not confirmed", m.id, len(players), lobby.GetLobbyId())
 		}
 		return err
 	}
@@ -257,9 +317,13 @@ func tick(ctx context.Context, db *sql.DB, dota *dota2.Dota2) error {
 			_, err := dota.DestroyLobby(ctx)
 			return err
 		}
-		dota.JoinLobbyTeam(proto.DOTA_GC_TEAM_DOTA_GC_TEAM_SPECTATOR, 0)
+		ensureWorkerInPlayerPool(dota, lobby, workerSteamID)
 		players, err := matchPlayers(db, m.id)
 		if err != nil {
+			return err
+		}
+		log.Printf("match %d: resuming lobby %d invite list (%d players)", m.id, lobby.GetLobbyId(), len(players))
+		if err := validateInviteRecipients(players, workerSteamID); err != nil {
 			return err
 		}
 		for _, p := range players {
@@ -267,17 +331,33 @@ func tick(ctx context.Context, db *sql.DB, dota *dota2.Dota2) error {
 			if err != nil {
 				return err
 			}
+			log.Printf("match %d: requesting invite to steamID %s (team %s) for lobby %d", m.id, p.steamID, p.team, lobby.GetLobbyId())
 			dota.InviteLobbyMember(steamid.SteamId(id))
 		}
+		lastLobbyInvite = time.Now()
 		_, err = db.Exec("UPDATE matches SET status='lobby',lobby_id=? WHERE id=? AND status='creating'", strconv.FormatUint(lobby.GetLobbyId(), 10), m.id)
 		return err
 	}
 	if m.status == "lobby" && lobby != nil {
+		playerPoolReady := ensureWorkerInPlayerPool(dota, lobby, workerSteamID)
 		players, err := matchPlayers(db, m.id)
 		if err != nil {
 			return err
 		}
-		if lobbyReady(lobby, players) {
+		if time.Since(lastLobbyInvite) >= 90*time.Second {
+			if err := validateInviteRecipients(players, workerSteamID); err != nil {
+				return err
+			}
+			for _, p := range players {
+				id, _ := strconv.ParseUint(p.steamID, 10, 64)
+				if !lobbyHasMember(lobby, id) {
+					log.Printf("match %d: retrying lobby invite request to steamID %s for lobby %d", m.id, p.steamID, lobby.GetLobbyId())
+					dota.InviteLobbyMember(steamid.SteamId(id))
+				}
+			}
+			lastLobbyInvite = time.Now()
+		}
+		if playerPoolReady && lobbyReady(lobby, players) {
 			status, err := matchStatus(db, m.id)
 			if err != nil {
 				return err
@@ -362,6 +442,9 @@ func tick(ctx context.Context, db *sql.DB, dota *dota2.Dota2) error {
 				return err
 			}
 		}
+		if err := applyMatchRatings(tx, m.id, winner); err != nil {
+			return err
+		}
 		if _, err := tx.Exec("UPDATE matches SET status='complete',winner=?,finished_at=? WHERE id=? AND status='results_pending'", winner, time.Now().UnixMilli(), m.id); err != nil {
 			return err
 		}
@@ -372,6 +455,25 @@ func tick(ctx context.Context, db *sql.DB, dota *dota2.Dota2) error {
 		return nil
 	}
 	return nil
+}
+
+func matchLobbyName(base string, matchID int64) string {
+	base = strings.TrimSpace(base)
+	if base == "" {
+		base = "Discord Inhouse"
+	}
+	return fmt.Sprintf("%s #%d", base, matchID)
+}
+
+func lobbyPassword(configured string) (string, error) {
+	if configured != "" {
+		return configured, nil
+	}
+	secret := make([]byte, 12)
+	if _, err := rand.Read(secret); err != nil {
+		return "", fmt.Errorf("generate lobby password: %w", err)
+	}
+	return hex.EncodeToString(secret), nil
 }
 
 func configuredGameMode(mode string) (uint32, error) {
@@ -439,6 +541,22 @@ func matchPlayers(db *sql.DB, matchID int64) ([]player, error) {
 	return players, rows.Err()
 }
 
+func validateInviteRecipients(players []player, workerSteamID uint64) error {
+	if workerSteamID == 0 {
+		return errors.New("worker SteamID is unavailable; cannot verify lobby invite recipients")
+	}
+	for _, p := range players {
+		id, err := strconv.ParseUint(p.steamID, 10, 64)
+		if err != nil {
+			return fmt.Errorf("invalid player SteamID %q: %w", p.steamID, err)
+		}
+		if id == workerSteamID {
+			return fmt.Errorf("player SteamID %s is the worker's own Steam account; use a separate account for the Dota player", p.steamID)
+		}
+	}
+	return nil
+}
+
 func currentLobby(dota *dota2.Dota2) (*proto.CSODOTALobby, error) {
 	container, err := dota.GetCache().GetContainerForTypeID(uint32(cso.Lobby))
 	if err != nil {
@@ -453,6 +571,61 @@ func currentLobby(dota *dota2.Dota2) (*proto.CSODOTALobby, error) {
 		return nil, fmt.Errorf("unexpected lobby cache type %T", obj)
 	}
 	return lobby, nil
+}
+
+func lobbyHasMember(lobby *proto.CSODOTALobby, steamID uint64) bool {
+	members := lobby.GetAllMembers()
+	for _, index := range lobby.GetMemberIndices() {
+		if int(index) < len(members) && members[index].GetId() == steamID {
+			return true
+		}
+	}
+	return false
+}
+
+func workerIsInPlayerPool(lobby *proto.CSODOTALobby, workerSteamID uint64) bool {
+	team, _, found := workerLobbyPosition(lobby, workerSteamID)
+	return found && team == proto.DOTA_GC_TEAM_DOTA_GC_TEAM_PLAYER_POOL
+}
+
+func workerLobbyPosition(lobby *proto.CSODOTALobby, workerSteamID uint64) (proto.DOTA_GC_TEAM, uint32, bool) {
+	members := lobby.GetAllMembers()
+	for _, index := range lobby.GetMemberIndices() {
+		if int(index) < len(members) {
+			member := members[index]
+			if member.GetId() == workerSteamID {
+				return member.GetTeam(), member.GetSlot(), true
+			}
+		}
+	}
+	return 0, 0, false
+}
+
+func ensureWorkerInPlayerPool(dota *dota2.Dota2, lobby *proto.CSODOTALobby, workerSteamID uint64) bool {
+	lobbyID := lobby.GetLobbyId()
+	if lastPlayerPoolLobbyID != lobbyID {
+		lastPlayerPoolLobbyID = lobbyID
+		lastPlayerPoolRequest = time.Time{}
+	}
+	if workerIsInPlayerPool(lobby, workerSteamID) {
+		if confirmedPlayerPoolLobbyID != lobbyID {
+			log.Printf("lobby %d: worker joined the player pool", lobbyID)
+			confirmedPlayerPoolLobbyID = lobbyID
+		}
+		return true
+	}
+	if time.Since(lastPlayerPoolRequest) < 10*time.Second {
+		return false
+	}
+	team, slot, found := workerLobbyPosition(lobby, workerSteamID)
+	if found {
+		log.Printf("lobby %d: worker is on team %s slot %d; requesting player pool", lobbyID, team, slot)
+	} else {
+		log.Printf("lobby %d: worker is absent from active members; requesting player pool", lobbyID)
+	}
+	dota.JoinLobbyTeam(proto.DOTA_GC_TEAM_DOTA_GC_TEAM_PLAYER_POOL, 1)
+	lastPlayerPoolRequest = time.Now()
+	return false
 }
 
 func lobbyReady(lobby *proto.CSODOTALobby, players []player) bool {

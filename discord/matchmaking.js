@@ -1,27 +1,82 @@
-export function selectPlayers(players, mode, priorityRoles = [], maxWaitMinutes = 30, now = Date.now()) {
+const POSITIONS = [1, 2, 3, 4, 5];
+
+export function selectPlayers(players, mode) {
   if (players.length < 10) return null;
   const oldest = [...players].sort((a, b) => (a.queue_order ?? a.joined_at) - (b.queue_order ?? b.joined_at) || a.discord_id.localeCompare(b.discord_id));
-  if (mode === 'fifo' || (mode === 'mmr' && now - oldest[0].joined_at >= maxWaitMinutes * 60_000)) return oldest.slice(0, 10);
+  if (mode === 'fifo' || mode === 'captain') return oldest.slice(0, 10);
   if (mode === 'role') {
-    const rank = p => {
-      const roles = JSON.parse(p.role_ids || '[]');
-      const index = priorityRoles.findIndex(id => roles.includes(id));
-      return index < 0 ? priorityRoles.length : index;
+    // Fill two places for each position. Augmenting paths preserve older players
+    // while allowing a flexible player to move when a later specialist joins.
+    const slots = Array(10).fill(null);
+    const visit = (player, seen) => {
+      for (const position of JSON.parse(player.preferred_positions || '[]')) {
+        if (!POSITIONS.includes(position)) continue;
+        for (const slot of [(position - 1) * 2, (position - 1) * 2 + 1]) {
+          if (seen.has(slot)) continue;
+          seen.add(slot);
+          if (!slots[slot] || visit(slots[slot], seen)) {
+            slots[slot] = player;
+            return true;
+          }
+        }
+      }
+      return false;
     };
-    return oldest.sort((a, b) => rank(a) - rank(b) || (a.queue_order ?? a.joined_at) - (b.queue_order ?? b.joined_at)).slice(0, 10);
-  }
-  if (mode === 'mmr') {
-    const byMMR = [...oldest].sort((a, b) => a.mmr - b.mmr || a.joined_at - b.joined_at);
-    let best = null;
-    for (let i = 0; i <= byMMR.length - 10; i++) {
-      const group = byMMR.slice(i, i + 10);
-      const spread = group[9].mmr - group[0].mmr;
-      const age = group.reduce((sum, p) => sum + p.joined_at, 0);
-      if (!best || spread < best.spread || (spread === best.spread && age < best.age)) best = { group, spread, age };
+    for (const player of oldest) {
+      visit(player, new Set());
+      if (slots.every(Boolean)) {
+        const selected = new Set(slots);
+        return oldest.filter(p => selected.has(p));
+      }
     }
-    return best.group.sort((a, b) => (a.queue_order ?? a.joined_at) - (b.queue_order ?? b.joined_at));
+    return null;
   }
   throw new Error(`Unknown queue mode: ${mode}`);
+}
+
+export function closestCaptains(players) {
+  if (players.length !== 10) throw new Error('Exactly ten players are required');
+  let best = null;
+  for (let i = 0; i < players.length; i++) {
+    for (let j = i + 1; j < players.length; j++) {
+      const gap = Math.abs(players[i].mmr - players[j].mmr);
+      if (!best || gap < best.gap) best = { gap, captains: [players[i], players[j]] };
+    }
+  }
+  return best.captains;
+}
+
+export function balanceRoleTeams(players) {
+  if (players.length !== 10) throw new Error('Exactly ten players are required');
+  const ordered = [...players].sort((a, b) =>
+    JSON.parse(a.preferred_positions).length - JSON.parse(b.preferred_positions).length ||
+    (a.queue_order ?? a.joined_at) - (b.queue_order ?? b.joined_at));
+  const pairs = Array.from({ length: 5 }, () => []);
+  const total = players.reduce((sum, p) => sum + p.mmr, 0);
+  let best = null;
+  const assign = index => {
+    if (index === ordered.length) {
+      for (let mask = 0; mask < 32; mask++) {
+        const radiantMMR = pairs.reduce((sum, pair, i) => sum + pair[(mask >> i) & 1].mmr, 0);
+        const gap = Math.abs(total - 2 * radiantMMR);
+        if (!best || gap < best.gap) {
+          const radiant = new Set(pairs.map((pair, i) => pair[(mask >> i) & 1].discord_id));
+          best = { gap, radiant, positions: new Map(pairs.flatMap((pair, i) => pair.map(p => [p.discord_id, i + 1]))) };
+        }
+      }
+      return;
+    }
+    const player = ordered[index];
+    for (const position of JSON.parse(player.preferred_positions)) {
+      if (!POSITIONS.includes(position) || pairs[position - 1].length === 2) continue;
+      pairs[position - 1].push(player);
+      assign(index + 1);
+      pairs[position - 1].pop();
+    }
+  };
+  assign(0);
+  if (!best) throw new Error('Selected players cannot fill two teams of positions 1–5');
+  return players.map(p => ({ ...p, team: best.radiant.has(p.discord_id) ? 'radiant' : 'dire', position: best.positions.get(p.discord_id) }));
 }
 
 export function balanceTeams(players) {

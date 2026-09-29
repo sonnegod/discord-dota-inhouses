@@ -4,7 +4,9 @@
   "type": "module",
   "scripts": {
     "start:discord": "node --env-file-if-exists=.env --experimental-sqlite discord/main.js",
-    "test": "node --experimental-sqlite --test discord/*.test.js"
+    "start:dota": "node --env-file-if-exists=.env scripts/start-dota.js",
+    "test": "node --experimental-sqlite --test discord/*.test.js",
+    "start": "node --env-file-if-exists=.env --experimental-sqlite scripts/start-all.js"
   },
   "dependencies": {
     "discord.js": "^14.27.0"
