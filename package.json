@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start:discord": "node --experimental-sqlite discord/main.js",
+    "start:discord": "node --env-file-if-exists=.env --experimental-sqlite discord/main.js",
     "test": "node --experimental-sqlite --test discord/*.test.js"
   },
   "dependencies": {

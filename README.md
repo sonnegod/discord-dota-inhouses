@@ -31,7 +31,7 @@ A server manager with **Manage Server** permission can use `/settings show`, `/s
 2. Create a Discord application and bot, invite it to one server with `bot` and `applications.commands` scopes, and grant it permission to send messages in the announcement channel. Only the `Guilds` gateway intent is used.
 3. Copy `.env.example` to `.env` and fill the values. Set `PUBLIC_BASE_URL` to the public HTTPS address that reaches `HTTP_ADDR`. Steam's OpenID callback must reach `/auth/steam/callback` on the Discord service; a reverse proxy or tunnel is needed when hosting locally. Use the same **absolute** `DB_PATH` for both processes.
 4. Run `npm install` and `go mod tidy`.
-5. Load the variables from `.env` in your shell or process manager. Start the Discord service first with `npm run start:discord`; it creates the database. Start the Dota worker with `go run ./dota`.
+5. Start the Discord service first with `npm run start:discord`; it automatically loads `.env` and creates the database. For the Dota worker, load the variables from `.env` in your shell or process manager, then run `go run ./dota`.
 6. Use `/link` and have ten players join the queue. Players must accept the Steam lobby invite and join the announced Radiant or Dire team. The worker launches when the lobby cache shows all ten on the correct teams.
 
 The Go service needs a Steam account able to log into Dota 2 and create practice lobbies. Set `STEAM_USERNAME` with either `STEAM_PASSWORD` or `STEAM_ACCESS_TOKEN`. If Steam Guard requires a code or mobile approval, supply a valid access token from a prior authenticated session; the worker does not implement an interactive Steam Guard prompt. Keep the `.env` file private. `QUEUE_MODE` and `LOBBY_GAME_MODE` seed the SQLite settings when the Discord service first starts with them; later changes through `/settings` persist across restarts. Use `LOBBY_GAME_MODE=cm` for Captains Mode (the default) or `LOBBY_GAME_MODE=ap` for All Pick. The worker makes an unlisted lobby and generates a random password when `LOBBY_PASS_KEY` is empty; players receive direct Steam invites. Set `LOBBY_SERVER_REGION` to the Dota region number for your group if Valve does not accept the default value of `0`.
@@ -39,6 +39,8 @@ The Go service needs a Steam account able to log into Dota 2 and create practice
 On Windows PowerShell, npm may resolve to a disabled `.ps1` shim. Run `npm.cmd install` and `npm.cmd run start:discord` in that case.
 
 ## Operations
+
+For a local lobby test, set `TEST_SOLO_LOBBY=true` in `.env` and restart the Discord bot and Dota worker after updating the code. One linked player using `/queue join` will form a lobby and receive an invite, assigned to Radiant. Solo test mode takes the oldest queued player regardless of queue mode. The lobby stays open without automatically launching a game; use `/cancelmatch` to end the test. Set `TEST_SOLO_LOBBY=false` and restart the Discord bot to restore the ten-player requirement.
 
 The database uses WAL mode so both services can read and write concurrently. Back up the `.db` file with SQLite's backup API or after both services are stopped. The Discord service registers server-specific slash commands when it starts.
 

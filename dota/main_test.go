@@ -40,6 +40,18 @@ func TestLobbyReadyRequiresExactAssignedTeams(t *testing.T) {
 	}
 }
 
+func TestSoloLobbyDoesNotAutoLaunch(t *testing.T) {
+	id := uint64(76561197960265729)
+	team := proto.DOTA_GC_TEAM_DOTA_GC_TEAM_GOOD_GUYS
+	lobby := &proto.CSODOTALobby{
+		AllMembers: []*proto.CSODOTALobbyMember{{Id: &id, Team: &team}},
+		MemberIndices: []uint32{0},
+	}
+	if lobbyReady(lobby, []player{{steamID: strconv.FormatUint(id, 10), team: "radiant"}}) {
+		t.Fatal("solo test lobby must stay open without auto-launching")
+	}
+}
+
 func TestConfiguredGameMode(t *testing.T) {
 	for _, test := range []struct {
 		mode string

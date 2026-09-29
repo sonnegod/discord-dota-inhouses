@@ -218,8 +218,9 @@ func tick(ctx context.Context, db *sql.DB, dota *dota2.Dota2) error {
 		if err != nil {
 			return err
 		}
-		if len(players) != 10 {
-			return fmt.Errorf("match %d has %d players, expected 10", m.id, len(players))
+		// Single-player matches are test lobbies; lobbyReady keeps them from auto-launching.
+		if len(players) != 10 && len(players) != 1 {
+			return fmt.Errorf("match %d has %d players, expected 10 (or 1 for a test lobby)", m.id, len(players))
 		}
 		for _, p := range players {
 			id, err := strconv.ParseUint(p.steamID, 10, 64)
