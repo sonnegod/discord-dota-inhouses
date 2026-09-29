@@ -1,0 +1,15 @@
+{
+  "name": "discord-dota-inhouses",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start:discord": "node --experimental-sqlite discord/main.js",
+    "test": "node --experimental-sqlite --test discord/*.test.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.27.0"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  }
+}
